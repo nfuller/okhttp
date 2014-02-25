@@ -22,10 +22,13 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.Socket;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -83,6 +86,8 @@ public final class SpdyConnection implements Closeable {
 
   /** Lazily-created map of in-flight pings awaiting a response. Guarded by this. */
   private Map<Integer, Ping> pings;
+  /** User code to run in response to push promise events. */
+  private final PushObserver pushObserver;
   private int nextPingId;
 
   static final int INITIAL_WINDOW_SIZE = 65535;
@@ -123,6 +128,7 @@ public final class SpdyConnection implements Closeable {
 
   private SpdyConnection(Builder builder) {
     protocol = builder.protocol;
+    pushObserver = builder.pushObserver;
     client = builder.client;
     handler = builder.handler;
     nextStreamId = builder.client ? 1 : 2;
@@ -157,7 +163,7 @@ public final class SpdyConnection implements Closeable {
 
   /** The protocol as selected using NPN or ALPN. */
   public Protocol getProtocol() {
-     return protocol;
+    return protocol;
   }
 
   /**
@@ -208,6 +214,7 @@ public final class SpdyConnection implements Closeable {
   public SpdyStream pushStream(int associatedStreamId, List<Header> requestHeaders, boolean out)
       throws IOException {
     if (client) throw new IllegalStateException("Client cannot push requests.");
+    if (protocol != Protocol.HTTP_2) throw new IllegalStateException("protocol != HTTP_2");
     return newStream(associatedStreamId, requestHeaders, out, false);
   }
 
@@ -219,14 +226,13 @@ public final class SpdyConnection implements Closeable {
    * @param in true to create an input stream that the remote peer can use to send data to us.
    *     Corresponds to {@code FLAG_UNIDIRECTIONAL}.
    */
-  public SpdyStream newStream(List<Header> requestHeaders, boolean out,
-      boolean in) throws IOException {
+  public SpdyStream newStream(List<Header> requestHeaders, boolean out, boolean in)
+      throws IOException {
     return newStream(0, requestHeaders, out, in);
   }
 
   private SpdyStream newStream(int associatedStreamId, List<Header> requestHeaders, boolean out,
-      boolean in)
-      throws IOException {
+      boolean in) throws IOException {
     boolean outFinished = !out;
     boolean inFinished = !in;
     int priority = -1; // TODO: permit the caller to specify a priority?
@@ -250,7 +256,8 @@ public final class SpdyConnection implements Closeable {
       if (associatedStreamId == 0) {
         frameWriter.synStream(outFinished, inFinished, streamId, associatedStreamId, priority, slot,
             requestHeaders);
-      } else {
+      } else { // HTTP/2 has a PUSH_PROMISE frame.
+        if (client) throw new IOException("Client attempted to push stream: " + associatedStreamId);
         frameWriter.pushPromise(associatedStreamId, streamId, requestHeaders);
       }
     }
@@ -491,6 +498,7 @@ public final class SpdyConnection implements Closeable {
     private BufferedSink sink;
     private IncomingStreamHandler handler = IncomingStreamHandler.REFUSE_INCOMING_STREAMS;
     private Protocol protocol = Protocol.SPDY_3;
+    private PushObserver pushObserver = PushObserver.CANCEL;
     private boolean client;
 
     public Builder(boolean client, Socket socket) throws IOException {
@@ -516,6 +524,11 @@ public final class SpdyConnection implements Closeable {
 
     public Builder protocol(Protocol protocol) {
       this.protocol = protocol;
+      return this;
+    }
+
+    public Builder pushObserver(PushObserver pushObserver) {
+      this.pushObserver = pushObserver;
       return this;
     }
 
@@ -557,6 +570,10 @@ public final class SpdyConnection implements Closeable {
 
     @Override public void data(boolean inFinished, int streamId, BufferedSource source, int length)
         throws IOException {
+      if (pushedStream(streamId)) {
+        pushDataLater(streamId, source, length, inFinished);
+        return;
+      }
       SpdyStream dataStream = getStream(streamId);
       if (dataStream == null) {
         writeSynResetLater(streamId, ErrorCode.INVALID_STREAM);
@@ -570,8 +587,11 @@ public final class SpdyConnection implements Closeable {
     }
 
     @Override public void headers(boolean outFinished, boolean inFinished, int streamId,
-        int associatedStreamId, int priority, List<Header> headerBlock,
-        HeadersMode headersMode) {
+        int associatedStreamId, int priority, List<Header> headerBlock, HeadersMode headersMode) {
+      if (pushedStream(streamId)) {
+        pushHeadersLater(streamId, headerBlock, inFinished);
+        return;
+      }
       SpdyStream stream;
       synchronized (SpdyConnection.this) {
         // If we're shutdown, don't bother with this stream.
@@ -623,6 +643,10 @@ public final class SpdyConnection implements Closeable {
     }
 
     @Override public void rstStream(int streamId, ErrorCode errorCode) {
+      if (pushedStream(streamId)) {
+        pushResetLater(streamId, errorCode);
+        return;
+      }
       SpdyStream rstStream = removeStream(streamId);
       if (rstStream != null) {
         rstStream.receiveRstStream(errorCode);
@@ -730,21 +754,81 @@ public final class SpdyConnection implements Closeable {
     }
 
     @Override
-    public void pushPromise(int streamId, int promisedStreamId, List<Header> requestHeaders)
-        throws IOException {
-      // TODO: Wire up properly and only cancel when local settings disable push.
-      cancelStreamLater(promisedStreamId);
+    public void pushPromise(int streamId, int promisedStreamId, List<Header> requestHeaders) {
+      pushRequestLater(promisedStreamId, requestHeaders);
     }
+  }
 
-    private void cancelStreamLater(final int streamId) {
-      executor.submit(new NamedRunnable("OkHttp %s Cancelling Stream %s", hostName, streamId) {
-        @Override public void execute() {
-          try {
-            frameWriter.rstStream(streamId, ErrorCode.CANCEL);
-          } catch (IOException ignored) {
-          }
-        }
-      });
+  /** Even, positive numbered streams are pushed streams in HTTP/2. */
+  private boolean pushedStream(int streamId) {
+    return protocol == Protocol.HTTP_2 && streamId != 0 && (streamId & 1) == 0;
+  }
+
+  private final Set<Integer> currentPushRequests =
+      Collections.synchronizedSet(new LinkedHashSet<Integer>());
+
+  private void pushRequestLater(final int streamId, final List<Header> requestHeaders) {
+    if (currentPushRequests.contains(streamId)) {
+      writeSynResetLater(streamId, ErrorCode.PROTOCOL_ERROR);
+      return;
     }
+    currentPushRequests.add(streamId);
+    executor.submit(new NamedRunnable("OkHttp %s Push Request[%s]", hostName, streamId) {
+      @Override public void execute() {
+        boolean cancel = pushObserver.onRequest(streamId, requestHeaders);
+        try {
+          if (cancel) {
+            frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+            currentPushRequests.remove(streamId);
+          }
+        } catch (IOException ignored) {
+        }
+      }
+    });
+  }
+
+  private void pushHeadersLater(final int streamId, final List<Header> requestHeaders,
+      final boolean inFinished) {
+    executor.submit(new NamedRunnable("OkHttp %s Push Headers[%s]", hostName, streamId) {
+      @Override public void execute() {
+        boolean cancel = pushObserver.onHeaders(streamId, requestHeaders, inFinished);
+        try {
+          if (cancel) frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+          if (cancel || inFinished) currentPushRequests.remove(streamId);
+        } catch (IOException ignored) {
+        }
+      }
+    });
+  }
+
+  /**
+   * Eagerly reads {@code length} bytes from the source before launching a background task to
+   * process the data.  This avoids corrupting the stream.
+   */
+  private void pushDataLater(final int streamId, final BufferedSource source, final int length,
+      final boolean inFinished) throws IOException {
+    final OkBuffer buffer = new OkBuffer();
+    source.require(length); // Eagerly read the frame before firing client thread.
+    source.read(buffer, length);
+    if (buffer.byteCount() != length) throw new IOException(buffer.byteCount() + " != " + length);
+    executor.submit(new NamedRunnable("OkHttp %s Push Data[%s]", hostName, streamId) {
+      @Override public void execute() {
+        try {
+          boolean cancel = pushObserver.onData(streamId, buffer, length, inFinished);
+          if (cancel) frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+          if (cancel || inFinished) currentPushRequests.remove(streamId);
+        } catch (IOException ignored) {
+        }
+      }
+    });
+  }
+
+  private void pushResetLater(final int streamId, final ErrorCode errorCode) {
+    executor.submit(new NamedRunnable("OkHttp %s Push Reset[%s]", hostName, streamId) {
+      @Override public void execute() {
+        pushObserver.onReset(streamId, errorCode);
+        currentPushRequests.remove(streamId);
+      }
+    });
   }
 }
