@@ -62,6 +62,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 import javax.net.ssl.HttpsURLConnection;
@@ -221,12 +222,14 @@ public final class URLConnectionTest {
       fail("Modified an unmodifiable view.");
     } catch (UnsupportedOperationException expected) {
     }
-    assertEquals("A", connection.getHeaderFieldKey(0));
-    assertEquals("c", connection.getHeaderField(0));
-    assertEquals("B", connection.getHeaderFieldKey(1));
-    assertEquals("d", connection.getHeaderField(1));
-    assertEquals("A", connection.getHeaderFieldKey(2));
-    assertEquals("e", connection.getHeaderField(2));
+    assertEquals(null, connection.getHeaderFieldKey(0));
+    assertEquals("HTTP/1.0 200 Fantastic", connection.getHeaderField(0));
+    assertEquals("A", connection.getHeaderFieldKey(1));
+    assertEquals("c", connection.getHeaderField(1));
+    assertEquals("B", connection.getHeaderFieldKey(2));
+    assertEquals("d", connection.getHeaderField(2));
+    assertEquals("A", connection.getHeaderFieldKey(3));
+    assertEquals("e", connection.getHeaderField(3));
   }
 
   @Test public void serverSendsInvalidResponseHeaders() throws Exception {
@@ -807,7 +810,7 @@ public final class URLConnectionTest {
     String tmp = System.getProperty("java.io.tmpdir");
     File cacheDir = new File(tmp, "HttpCache-" + UUID.randomUUID());
     cache = new HttpResponseCache(cacheDir, Integer.MAX_VALUE);
-    client.setResponseCache(cache);
+    client.setOkResponseCache(cache);
   }
 
   /** Test which headers are sent unencrypted to the HTTP proxy. */
@@ -2208,22 +2211,35 @@ public final class URLConnectionTest {
   }
 
   /** Don't explode if the cache returns a null body. http://b/3373699 */
-  @Test public void installDeprecatedJavaNetResponseCache() throws Exception {
-    ResponseCache cache = new ResponseCache() {
+  @Test public void responseCacheReturnsNullOutputStream() throws Exception {
+    final AtomicBoolean aborted = new AtomicBoolean();
+    client.setResponseCache(new ResponseCache() {
       @Override public CacheResponse get(URI uri, String requestMethod,
           Map<String, List<String>> requestHeaders) throws IOException {
         return null;
       }
-      @Override public CacheRequest put(URI uri, URLConnection connection) throws IOException {
-        return null;
-      }
-    };
 
-    try {
-      client.setResponseCache(cache);
-      fail();
-    } catch (UnsupportedOperationException expected) {
-    }
+      @Override public CacheRequest put(URI uri, URLConnection connection) throws IOException {
+        return new CacheRequest() {
+          @Override public void abort() {
+            aborted.set(true);
+          }
+
+          @Override public OutputStream getBody() throws IOException {
+            return null;
+          }
+        };
+      }
+    });
+
+    server.enqueue(new MockResponse().setBody("abcdef"));
+    server.play();
+
+    HttpURLConnection connection = client.open(server.getUrl("/"));
+    InputStream in = connection.getInputStream();
+    assertEquals("abc", readAscii(in, 3));
+    in.close();
+    assertFalse(aborted.get()); // The best behavior is ambiguous, but RI 6 doesn't abort here
   }
 
   /** http://code.google.com/p/android/issues/detail?id=14562 */
@@ -2675,6 +2691,27 @@ public final class URLConnectionTest {
 
     RecordedRequest request = server.takeRequest();
     assertEquals(Long.toString(contentLength), request.getHeader("Content-Length"));
+  }
+
+  /**
+   * Confirms the strange behavior specified about the status line being treated like a header
+   * at position 0 with a null key.
+   */
+  @Test public void responseHeaderStatusLine() throws Exception {
+    String expectedStatusLine = "HTTP/1.1 200 Fantastic";
+    server.enqueue(new MockResponse().setStatus(expectedStatusLine));
+    server.play();
+
+    connection = client.open(server.getUrl("/"));
+    connection.connect();
+
+    assertEquals(expectedStatusLine, connection.getHeaderField(null));
+    assertNull(connection.getHeaderFieldKey(0));
+    assertEquals(expectedStatusLine, connection.getHeaderField(0));
+    Map.Entry<String, List<String>> firstHeader =
+        connection.getHeaderFields().entrySet().iterator().next();
+    assertNull(firstHeader.getKey());
+    assertEquals(Collections.singletonList(expectedStatusLine), firstHeader.getValue());
   }
 
   /**
