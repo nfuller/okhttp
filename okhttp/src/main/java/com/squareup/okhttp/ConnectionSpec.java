@@ -113,7 +113,35 @@ public final class ConnectionSpec {
     }
 
     sslSocket.setEnabledProtocols(specToApply.tlsVersions);
-    sslSocket.setEnabledCipherSuites(specToApply.cipherSuites);
+
+    String[] cipherSuitesToEnable = specToApply.cipherSuites;
+    if (route.shouldSendTlsFallbackIndicator) {
+      // In accordance with https://tools.ietf.org/html/draft-ietf-tls-downgrade-scsv-00
+      // the SCSV cipher is added to signal that a protocol fallback has taken place.
+      final String fallbackScsv = "TLS_FALLBACK_SCSV";
+      boolean socketSupportsFallbackScsv =
+          Arrays.asList(sslSocket.getSupportedCipherSuites()).contains(fallbackScsv);
+
+      // TODO(nfuller): If it doesn't support TLS_FALLBACK_SCSV, is this ok, a warning to log, or an
+      // error? We can know sooner if this check would fail (using
+      // sslSocketFactory.getSupportedCipherSuites()) but there's no obvious place to put
+      // the check.
+      // It's also true that Android will want to set this to true, but Android may be used with
+      // socket factories that don't support TLS_FALLBACK_SCSV. However, that check can probably be
+      // done when the OkHttpClient is being configured.
+      // BTW: This is why the field is called "should" and not "mustSendTlsFallbackIndicator".
+
+      if (socketSupportsFallbackScsv) {
+        // Add the SCSV cipher to the set of enabled ciphers.
+        String[] oldEnabledCipherSuites = cipherSuitesToEnable;
+        String[] newEnabledCipherSuites = new String[oldEnabledCipherSuites.length + 1];
+        System.arraycopy(oldEnabledCipherSuites, 0,
+            newEnabledCipherSuites, 0, oldEnabledCipherSuites.length);
+        newEnabledCipherSuites[newEnabledCipherSuites.length - 1] = fallbackScsv;
+        cipherSuitesToEnable = newEnabledCipherSuites;
+      }
+    }
+    sslSocket.setEnabledCipherSuites(cipherSuitesToEnable);
 
     Platform platform = Platform.get();
     if (specToApply.supportsTlsExtensions) {

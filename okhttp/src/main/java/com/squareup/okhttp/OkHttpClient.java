@@ -148,6 +148,7 @@ public class OkHttpClient implements Cloneable {
   private int connectTimeout;
   private int readTimeout;
   private int writeTimeout;
+  private boolean tlsFallbackScsvEnabled;
 
   public OkHttpClient() {
     routeDatabase = new RouteDatabase();
@@ -176,6 +177,7 @@ public class OkHttpClient implements Cloneable {
     this.connectTimeout = okHttpClient.connectTimeout;
     this.readTimeout = okHttpClient.readTimeout;
     this.writeTimeout = okHttpClient.writeTimeout;
+    this.tlsFallbackScsvEnabled = okHttpClient.tlsFallbackScsvEnabled;
   }
 
   /**
@@ -356,6 +358,22 @@ public class OkHttpClient implements Cloneable {
 
   public final CertificatePinner getCertificatePinner() {
     return certificatePinner;
+  }
+
+  /**
+   * Determines whether the client should attempt to conform to
+   * https://tools.ietf.org/html/draft-ietf-tls-downgrade-scsv-00. This means that connections
+   * will use a Signaling Cipher Suite Value (SCSV) to prevent unintended protocol downgrades
+   * between clients and servers. This behavior is only actually enabled when used with socket
+   * factories that support the TLS_FALLBACK_SCSV cipher value.
+   */
+  public final OkHttpClient setTlsFallbackScsvEnabled(boolean tlsFallbackScsvEnabled) {
+    this.tlsFallbackScsvEnabled = tlsFallbackScsvEnabled;
+    return this;
+  }
+
+  public final boolean isTlsFallbackScsvEnabled() {
+    return tlsFallbackScsvEnabled;
   }
 
   /**

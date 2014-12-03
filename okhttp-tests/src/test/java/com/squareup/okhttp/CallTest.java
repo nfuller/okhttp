@@ -34,6 +34,7 @@ import java.net.HttpURLConnection;
 import java.net.SocketException;
 import java.net.URL;
 import java.security.cert.Certificate;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -49,8 +50,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLPeerUnverifiedException;
-import javax.net.ssl.SSLProtocolException;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -78,11 +82,19 @@ public final class CallTest {
   private RecordingCallback callback = new RecordingCallback();
   private TestLogHandler logHandler = new TestLogHandler();
   private UncaughtExceptionHandler defaultUncaughtExceptionHandler;
+  private SSLSocketFactory serverSocketFactory;
 
   private static final SSLContext sslContext = SslContextBuilder.localhost();
   private Cache cache;
 
   @Before public void setUp() throws Exception {
+    server = new MockWebServer();
+    server2 = new MockWebServer();
+    serverSocketFactory = new AndroidSafeSSLSocketFactory(sslContext.getSocketFactory());
+    client = new OkHttpClient();
+    callback = new RecordingCallback();
+    logHandler = new TestLogHandler();
+
     String tmp = System.getProperty("java.io.tmpdir");
     File cacheDir = new File(tmp, "HttpCache-" + UUID.randomUUID());
     cache = new Cache(cacheDir, Integer.MAX_VALUE);
@@ -581,7 +593,7 @@ public final class CallTest {
   }
 
   @Test public void tls() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse()
         .setBody("abc")
         .addHeader("Content-Type: text/plain"));
@@ -595,7 +607,7 @@ public final class CallTest {
   }
 
   @Test public void tls_Async() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse()
         .setBody("abc")
         .addHeader("Content-Type: text/plain"));
@@ -613,7 +625,7 @@ public final class CallTest {
   }
 
   @Test public void recoverFromTlsHandshakeFailure() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
     server.play();
@@ -626,8 +638,42 @@ public final class CallTest {
         .assertBody("abc");
   }
 
+  @Test public void recoverFromTlsHandshakeFailure_tlsFallbackScsvEnabled() throws Exception {
+    final String tlsFallbackScsv = "TLS_FALLBACK_SCSV";
+    List<String> supportedCiphers =
+        Arrays.asList(sslContext.getSocketFactory().getSupportedCipherSuites());
+    if (!supportedCiphers.contains(tlsFallbackScsv)) {
+      // This only works if the client socket supports TLS_FALLBACK_SCSV.
+      return;
+    }
+
+    server.useHttps(serverSocketFactory, false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.play();
+
+    RecordingSSLSocketFactory clientSocketFactory =
+        new RecordingSSLSocketFactory(sslContext.getSocketFactory());
+    client.setSslSocketFactory(clientSocketFactory);
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    client.setTlsFallbackScsvEnabled(true);
+    Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SSLHandshakeException expected) {
+    }
+
+    List<SSLSocket> clientSockets = clientSocketFactory.getSocketsCreated();
+    SSLSocket firstSocket = clientSockets.get(0);
+    assertFalse(Arrays.asList(firstSocket.getEnabledCipherSuites()).contains(tlsFallbackScsv));
+    SSLSocket secondSocket = clientSockets.get(1);
+    assertTrue(Arrays.asList(secondSocket.getEnabledCipherSuites()).contains(tlsFallbackScsv));
+  }
+
   @Test public void recoverFromTlsHandshakeFailure_Async() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
     server.play();
@@ -646,7 +692,7 @@ public final class CallTest {
   @Test public void noRecoveryFromTlsHandshakeFailureWhenTlsFallbackIsDisabled() throws Exception {
     client.setConnectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT));
 
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.play();
 
@@ -658,7 +704,7 @@ public final class CallTest {
     try {
       client.newCall(request).execute();
       fail();
-    } catch (SSLProtocolException expected) {
+    } catch (SSLHandshakeException expected) {
     }
   }
 
@@ -680,7 +726,7 @@ public final class CallTest {
   }
 
   @Test public void setFollowSslRedirectsFalse() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse()
         .setResponseCode(301)
         .addHeader("Location: http://square.com"));
@@ -696,7 +742,7 @@ public final class CallTest {
   }
 
   @Test public void matchingPinnedCertificate() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse());
     server.enqueue(new MockResponse());
     server.play();
@@ -720,7 +766,7 @@ public final class CallTest {
   }
 
   @Test public void unmatchingPinnedCertificate() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse());
     server.play();
 
@@ -1518,7 +1564,7 @@ public final class CallTest {
     client.setSslSocketFactory(sslContext.getSocketFactory());
     client.setHostnameVerifier(new RecordingHostnameVerifier());
     client.setProtocols(Arrays.asList(protocol, Protocol.HTTP_1_1));
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.setProtocols(client.getProtocols());
   }
 
@@ -1542,6 +1588,24 @@ public final class CallTest {
       if (header.matches(pattern)) {
         fail("Header " + header + " matches " + pattern);
       }
+    }
+  }
+
+  private static class RecordingSSLSocketFactory extends DelegatingSSLSocketFactory {
+
+    private List<SSLSocket> socketsCreated = new ArrayList<SSLSocket>();
+
+    public RecordingSSLSocketFactory(SSLSocketFactory delegate) {
+      super(delegate);
+    }
+
+    @Override
+    protected void configureSocket(SSLSocket sslSocket) throws IOException {
+      socketsCreated.add(sslSocket);
+    }
+
+    public List<SSLSocket> getSocketsCreated() {
+      return socketsCreated;
     }
   }
 }

@@ -60,6 +60,7 @@ public final class RouteSelector {
   private final ConnectionPool pool;
   private final RouteDatabase routeDatabase;
   private final Request request;
+  private final boolean tlsScsvFallbackEnabled;
 
   /* The most recently attempted route. */
   private Proxy lastProxy;
@@ -87,6 +88,7 @@ public final class RouteSelector {
     this.client = client;
     this.proxySelector = client.getProxySelector();
     this.pool = client.getConnectionPool();
+    this.tlsScsvFallbackEnabled = client.isTlsFallbackScsvEnabled();
     this.routeDatabase = Internal.instance.routeDatabase(client);
     this.network = Internal.instance.network(client);
     this.request = request;
@@ -162,7 +164,9 @@ public final class RouteSelector {
     }
     lastSpec = nextConnectionSpec();
 
-    Route route = new Route(address, lastProxy, lastInetSocketAddress, lastSpec);
+    final boolean sendTlsFallbackIndicator = mustSendTlsFallbackIndicator(lastSpec);
+    Route route = new Route(address, lastProxy, lastInetSocketAddress, lastSpec,
+        sendTlsFallbackIndicator);
     if (routeDatabase.shouldPostpone(route)) {
       postponedRoutes.add(route);
       // We will only recurse in order to skip previously failed routes. They will be tried last.
@@ -170,6 +174,12 @@ public final class RouteSelector {
     }
 
     return new Connection(pool, route);
+  }
+
+  private boolean mustSendTlsFallbackIndicator(ConnectionSpec connectionSpec) {
+    return tlsScsvFallbackEnabled
+        && connectionSpec != connectionSpecs.get(0)
+        && connectionSpec.isTls();
   }
 
   /**
@@ -193,8 +203,10 @@ public final class RouteSelector {
     // selector and also in the route database.
     if (!(failure instanceof SSLHandshakeException) && !(failure instanceof SSLProtocolException)) {
       while (nextSpecIndex < connectionSpecs.size()) {
-        Route toSuppress = new Route(address, lastProxy, lastInetSocketAddress,
-            connectionSpecs.get(nextSpecIndex++));
+        final ConnectionSpec connectionSpec = connectionSpecs.get(nextSpecIndex++);
+        final boolean sendTlsFallbackIndicator = mustSendTlsFallbackIndicator(connectionSpec);
+        Route toSuppress = new Route(address, lastProxy, lastInetSocketAddress, connectionSpec,
+            sendTlsFallbackIndicator);
         routeDatabase.failed(toSuppress);
       }
     }

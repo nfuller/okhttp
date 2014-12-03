@@ -16,6 +16,7 @@
 
 package com.squareup.okhttp.internal.http;
 
+import com.squareup.okhttp.AndroidSafeSSLSocketFactory;
 import com.squareup.okhttp.Cache;
 import com.squareup.okhttp.Challenge;
 import com.squareup.okhttp.ConnectionSpec;
@@ -116,11 +117,13 @@ public final class URLConnectionTest {
   private OkUrlFactory client;
   private HttpURLConnection connection;
   private Cache cache;
+  private AndroidSafeSSLSocketFactory serverSocketFactory;
 
   @Before public void setUp() throws Exception {
     server = new MockWebServer();
     server.setProtocolNegotiationEnabled(false);
     server2 = new MockWebServer();
+    serverSocketFactory = new AndroidSafeSSLSocketFactory(sslContext.getSocketFactory());
     client = new OkUrlFactory(new OkHttpClient());
   }
 
@@ -533,7 +536,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void connectViaHttps() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("this response comes via HTTPS"));
     server.play();
 
@@ -548,7 +551,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void inspectHandshakeThroughoutRequestLifecycle() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse());
     server.play();
 
@@ -578,7 +581,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void connectViaHttpsReusingConnections() throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("this response comes via HTTPS"));
     server.enqueue(new MockResponse().setBody("another response via HTTPS"));
     server.play();
@@ -601,7 +604,7 @@ public final class URLConnectionTest {
 
   @Test public void connectViaHttpsReusingConnectionsDifferentFactories()
       throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("this response comes via HTTPS"));
     server.enqueue(new MockResponse().setBody("another response via HTTPS"));
     server.play();
@@ -622,7 +625,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void connectViaHttpsWithSSLFallback() throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("this response comes via SSL"));
     server.play();
@@ -644,7 +647,7 @@ public final class URLConnectionTest {
    * https://github.com/square/okhttp/issues/515
    */
   @Test public void sslFallbackNotUsedWhenRecycledConnectionFails() throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse()
         .setBody("abc")
         .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
@@ -670,7 +673,7 @@ public final class URLConnectionTest {
    * http://code.google.com/p/android/issues/detail?id=13178
    */
   @Test public void connectViaHttpsToUntrustedServer() throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse()); // unused
     server.play();
 
@@ -733,7 +736,7 @@ public final class URLConnectionTest {
     };
 
     if (useHttps) {
-      server.useHttps(sslContext.getSocketFactory(), false);
+      server.useHttps(serverSocketFactory, false);
       client.client().setSslSocketFactory(sslContext.getSocketFactory());
       client.client().setHostnameVerifier(new RecordingHostnameVerifier());
     }
@@ -788,7 +791,7 @@ public final class URLConnectionTest {
   }
 
   private void testConnectViaDirectProxyToHttps(ProxyConfig proxyConfig) throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("this response comes via HTTPS"));
     server.play();
 
@@ -826,7 +829,7 @@ public final class URLConnectionTest {
   private void testConnectViaHttpProxyToHttps(ProxyConfig proxyConfig) throws Exception {
     RecordingHostnameVerifier hostnameVerifier = new RecordingHostnameVerifier();
 
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(serverSocketFactory, true);
     server.enqueue(
         new MockResponse().setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END).clearHeaders());
     server.enqueue(new MockResponse().setBody("this response comes via a secure proxy"));
@@ -854,7 +857,7 @@ public final class URLConnectionTest {
   @Test public void connectViaHttpProxyToHttpsUsingBadProxyAndHttpResponseCache() throws Exception {
     initResponseCache();
 
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(serverSocketFactory, true);
     MockResponse response = new MockResponse() // Key to reproducing b/6754912
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
         .setBody("bogus proxy connect response content");
@@ -898,7 +901,7 @@ public final class URLConnectionTest {
       throws IOException, InterruptedException {
     RecordingHostnameVerifier hostnameVerifier = new RecordingHostnameVerifier();
 
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(serverSocketFactory, true);
     server.enqueue(
         new MockResponse().setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END).clearHeaders());
     server.enqueue(new MockResponse().setBody("encrypted response from the origin server"));
@@ -928,7 +931,7 @@ public final class URLConnectionTest {
 
   @Test public void proxyAuthenticateOnConnect() throws Exception {
     Authenticator.setDefault(new RecordingAuthenticator());
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(serverSocketFactory, true);
     server.enqueue(new MockResponse().setResponseCode(407)
         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\""));
     server.enqueue(
@@ -960,7 +963,7 @@ public final class URLConnectionTest {
   // Don't disconnect after building a tunnel with CONNECT
   // http://code.google.com/p/android/issues/detail?id=37221
   @Test public void proxyWithConnectionClose() throws IOException {
-    server.useHttps(sslContext.getSocketFactory(), true);
+    server.useHttps(serverSocketFactory, true);
     server.enqueue(
         new MockResponse().setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END).clearHeaders());
     server.enqueue(new MockResponse().setBody("this response comes via a proxy"));
@@ -1596,7 +1599,7 @@ public final class URLConnectionTest {
    * http://code.google.com/p/android/issues/detail?id=12860
    */
   private void testSecureStreamingPost(StreamingMode streamingMode) throws Exception {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("Success!"));
     server.play();
 
@@ -1773,7 +1776,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void redirectedOnHttps() throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
         .addHeader("Location: /foo")
         .setBody("This page has moved!"));
@@ -1794,7 +1797,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void notRedirectedFromHttpsToHttp() throws IOException, InterruptedException {
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
         .addHeader("Location: http://anyhost/foo")
         .setBody("This page has moved!"));
@@ -1823,7 +1826,7 @@ public final class URLConnectionTest {
     server2.enqueue(new MockResponse().setBody("This is insecure HTTP!"));
     server2.play();
 
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
         .addHeader("Location: " + server2.getUrl("/"))
         .setBody("This page has moved!"));
@@ -1871,7 +1874,7 @@ public final class URLConnectionTest {
   private void redirectToAnotherOriginServer(boolean https) throws Exception {
     server2 = new MockWebServer();
     if (https) {
-      server.useHttps(sslContext.getSocketFactory(), false);
+      server.useHttps(serverSocketFactory, false);
       server2.useHttps(sslContext.getSocketFactory(), false);
       server2.setProtocolNegotiationEnabled(false);
       client.client().setSslSocketFactory(sslContext.getSocketFactory());
@@ -2166,7 +2169,7 @@ public final class URLConnectionTest {
 
     client.client().setHostnameVerifier(hostnameVerifier);
     client.client().setSslSocketFactory(sc.getSocketFactory());
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.enqueue(new MockResponse().setBody("ABC"));
     server.enqueue(new MockResponse().setBody("DEF"));
     server.enqueue(new MockResponse().setBody("GHI"));
@@ -3280,7 +3283,7 @@ public final class URLConnectionTest {
     client.client().setSslSocketFactory(sslContext.getSocketFactory());
     client.client().setHostnameVerifier(new RecordingHostnameVerifier());
     client.client().setProtocols(Arrays.asList(protocol, Protocol.HTTP_1_1));
-    server.useHttps(sslContext.getSocketFactory(), false);
+    server.useHttps(serverSocketFactory, false);
     server.setProtocolNegotiationEnabled(true);
     server.setProtocols(client.client().getProtocols());
   }
