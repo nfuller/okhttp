@@ -17,7 +17,10 @@
 
 package com.squareup.okhttp.internal.http;
 
+import com.squareup.okhttp.Address;
+import com.squareup.okhttp.CertificatePinner;
 import com.squareup.okhttp.Connection;
+import com.squareup.okhttp.ConnectionPool;
 import com.squareup.okhttp.Headers;
 import com.squareup.okhttp.MediaType;
 import com.squareup.okhttp.OkHttpClient;
@@ -35,12 +38,12 @@ import java.net.CookieHandler;
 import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.URL;
-import java.security.cert.CertificateException;
+import java.net.UnknownHostException;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
-import javax.net.ssl.SSLHandshakeException;
-import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLSocketFactory;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -104,7 +107,6 @@ public final class HttpEngine {
   final OkHttpClient client;
 
   private Connection connection;
-  private RouteSelector routeSelector;
   private Route route;
   private final Response priorResponse;
 
@@ -175,22 +177,14 @@ public final class HttpEngine {
   /**
    * @param request the HTTP request without a body. The body must be
    *     written via the engine's request body stream.
-   * @param connection the connection used for an intermediate response
-   *     immediately prior to this request/response pair, such as a same-host
-   *     redirect. This engine assumes ownership of the connection and must
-   *     release it when it is unneeded.
-   * @param routeSelector the route selector used for a failed attempt
-   *     immediately preceding this attempt, or null if this request doesn't
-   *     recover from a failure.
    */
   public HttpEngine(OkHttpClient client, Request request, boolean bufferRequestBody,
-      Connection connection, RouteSelector routeSelector, RetryableSink requestBodyOut,
+      Connection connection, RetryableSink requestBodyOut,
       Response priorResponse) {
     this.client = client;
     this.userRequest = request;
     this.bufferRequestBody = bufferRequestBody;
     this.connection = connection;
-    this.routeSelector = routeSelector;
     this.requestBodyOut = requestBodyOut;
     this.priorResponse = priorResponse;
 
@@ -307,12 +301,55 @@ public final class HttpEngine {
   private void connect(Request request) throws IOException {
     if (connection != null) throw new IllegalStateException();
 
-    if (routeSelector == null) {
-      routeSelector = RouteSelector.get(request, client);
+    Address address = createAddress(client, request);
+
+    // Always prefer pooled connections over new connections.
+    Connection pooled = getConnectionFromPool(client.getConnectionPool(), address,
+        request.method());
+    if (pooled != null) {
+      connection = pooled;
+      // TODO(nfuller): No need to set owner?
+      Internal.instance.setOwner(connection, this);
+    } else {
+      RouteSelector routeSelector = RouteSelectorImpl.get(address, request, client);
+      connection = new Connection(client.getConnectionPool(), routeSelector);
+      Internal.instance.connectAndSetOwner(client, connection, this, request);
+    }
+    route = connection.getRoute();
+  }
+
+  private static Address createAddress(OkHttpClient client, Request request)
+      throws UnknownHostException {
+
+    String uriHost = request.url().getHost();
+    if (uriHost == null || uriHost.length() == 0) {
+      throw new UnknownHostException(request.url().toString());
     }
 
-    connection = routeSelector.next(this);
-    route = connection.getRoute();
+    SSLSocketFactory sslSocketFactory = null;
+    HostnameVerifier hostnameVerifier = null;
+    CertificatePinner certificatePinner = null;
+    if (request.isHttps()) {
+      sslSocketFactory = client.getSslSocketFactory();
+      hostnameVerifier = client.getHostnameVerifier();
+      certificatePinner = client.getCertificatePinner();
+    }
+
+    return new Address(uriHost, getEffectivePort(request.url()),
+        client.getSocketFactory(), sslSocketFactory, hostnameVerifier, certificatePinner,
+        client.getAuthenticator(), client.getProxy(), client.getProtocols(),
+        client.getConnectionSpecs());
+  }
+
+  private static Connection getConnectionFromPool(
+      ConnectionPool connectionPool, Address address, String method) throws IOException {
+    for (Connection pooled; (pooled = connectionPool.get(address)) != null; ) {
+      if (method.equals("GET") || Internal.instance.isReadable(pooled)) {
+        return pooled;
+      }
+      pooled.getSocket().close();
+    }
+    return null;
   }
 
   /**
@@ -380,37 +417,23 @@ public final class HttpEngine {
    * the failure is permanent. Requests with a body can only be recovered if the
    * body is buffered.
    */
+  // TODO(nfuller): Remove the exception?
   public HttpEngine recover(IOException e, Sink requestBodyOut) {
-    if (routeSelector != null && connection != null) {
-      routeSelector.connectFailed(connection, e);
-    }
-
     boolean canRetryRequestBody = requestBodyOut == null || requestBodyOut instanceof RetryableSink;
-    if (routeSelector == null && connection == null // No connection.
-        || routeSelector != null && !routeSelector.hasNext() // No more routes to attempt.
-        || !isRecoverable(e)
+    if (connection == null // No connection.
         || !canRetryRequestBody) {
       return null;
     }
 
     Connection connection = close();
 
-    // For failure recovery, use the same route selector with a new connection.
-    return new HttpEngine(client, userRequest, bufferRequestBody, connection, routeSelector,
+    // For failure recovery, use a new connection.
+    return new HttpEngine(client, userRequest, bufferRequestBody, connection,
         (RetryableSink) requestBodyOut, priorResponse);
   }
 
   public HttpEngine recover(IOException e) {
     return recover(e, requestBodyOut);
-  }
-
-  private boolean isRecoverable(IOException e) {
-    // If the problem was a CertificateException from the X509TrustManager,
-    // do not retry, we didn't have an abrupt server-initiated exception.
-    boolean sslFailure = e instanceof SSLPeerUnverifiedException
-        || (e instanceof SSLHandshakeException && e.getCause() instanceof CertificateException);
-    boolean protocolFailure = e instanceof ProtocolException;
-    return !sslFailure && !protocolFailure;
   }
 
   /**

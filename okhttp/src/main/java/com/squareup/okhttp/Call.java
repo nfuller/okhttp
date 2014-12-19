@@ -248,7 +248,7 @@ public class Call {
     }
 
     // Create the initial HTTP engine. Retries and redirects need new engine for each attempt.
-    engine = new HttpEngine(client, request, false, null, null, null, null);
+    engine = new HttpEngine(client, request, false, null, null, null);
 
     int redirectionCount = 0;
     while (true) {
@@ -299,7 +299,7 @@ public class Call {
 
       Connection connection = engine.close();
       request = followUp;
-      engine = new HttpEngine(client, request, false, connection, null, null, response);
+      engine = new HttpEngine(client, request, false, connection, null, response);
     }
   }
 

@@ -19,6 +19,7 @@ import com.squareup.okhttp.internal.RecordingHostnameVerifier;
 import com.squareup.okhttp.internal.SslContextBuilder;
 import com.squareup.okhttp.internal.Util;
 import com.squareup.okhttp.internal.http.AuthenticatorAdapter;
+import com.squareup.okhttp.internal.http.RouteSelector;
 import com.squareup.okhttp.mockwebserver.MockWebServer;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -91,22 +92,23 @@ public final class ConnectionPoolTest {
     spdySocketAddress = new InetSocketAddress(InetAddress.getByName(spdyServer.getHostName()),
         spdyServer.getPort());
 
-    Route httpRoute = new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress,
-        ConnectionSpec.CLEARTEXT);
-    Route spdyRoute = new Route(spdyAddress, Proxy.NO_PROXY, spdySocketAddress,
-        ConnectionSpec.MODERN_TLS);
+    RouteSelector httpRouteSelector = new SingleRouteSelector(
+        new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, ConnectionSpec.CLEARTEXT));
+    RouteSelector spdyRouteSelector = new SingleRouteSelector(
+        new Route(spdyAddress, Proxy.NO_PROXY, spdySocketAddress, ConnectionSpec.MODERN_TLS));
+
     pool = new ConnectionPool(poolSize, KEEP_ALIVE_DURATION_MS);
-    httpA = new Connection(pool, httpRoute);
+    httpA = new Connection(pool, httpRouteSelector);
     httpA.connect(200, 200, 200, null);
-    httpB = new Connection(pool, httpRoute);
+    httpB = new Connection(pool, httpRouteSelector);
     httpB.connect(200, 200, 200, null);
-    httpC = new Connection(pool, httpRoute);
+    httpC = new Connection(pool, httpRouteSelector);
     httpC.connect(200, 200, 200, null);
-    httpD = new Connection(pool, httpRoute);
+    httpD = new Connection(pool, httpRouteSelector);
     httpD.connect(200, 200, 200, null);
-    httpE = new Connection(pool, httpRoute);
+    httpE = new Connection(pool, httpRouteSelector);
     httpE.connect(200, 200, 200, null);
-    spdyA = new Connection(pool, spdyRoute);
+    spdyA = new Connection(pool, spdyRouteSelector);
     spdyA.connect(20000, 20000, 2000, null);
 
     owner = new Object();
@@ -139,8 +141,8 @@ public final class ConnectionPoolTest {
     Connection connection = pool.get(httpAddress);
     assertNull(connection);
 
-    connection = new Connection(pool, new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress,
-        ConnectionSpec.CLEARTEXT));
+    Route route = new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, ConnectionSpec.CLEARTEXT);
+    connection = new Connection(pool, new SingleRouteSelector(route));
     connection.connect(200, 200, 200, null);
     connection.setOwner(owner);
     assertEquals(0, pool.getConnectionCount());
@@ -423,5 +425,35 @@ public final class ConnectionPoolTest {
 
   private void assertPooled(ConnectionPool pool, Connection... connections) throws Exception {
     assertEquals(Arrays.asList(connections), pool.getConnections());
+  }
+
+  private static class SingleRouteSelector implements RouteSelector {
+
+    private final Route singleRoute;
+
+    boolean hasReturnedRoute;
+
+    public SingleRouteSelector(Route singleRoute) {
+      this.singleRoute = singleRoute;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return !hasReturnedRoute;
+    }
+
+    @Override
+    public Route next() throws IOException {
+      if (!hasReturnedRoute) {
+        hasReturnedRoute = true;
+        return singleRoute;
+      }
+      throw new AssertionError();
+    }
+
+    @Override
+    public boolean connectFailed(Connection connection, IOException failure) {
+      return false;
+    }
   }
 }

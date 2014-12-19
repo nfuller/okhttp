@@ -349,7 +349,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
       engineClient = client.clone().setCache(null);
     }
 
-    return new HttpEngine(engineClient, request, bufferRequestBody, connection, null, requestBody,
+    return new HttpEngine(engineClient, request, bufferRequestBody, connection, requestBody,
         priorResponse);
   }
 
@@ -419,7 +419,8 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
    * retried. Throws an exception if the request failed permanently.
    */
   private boolean execute(boolean readResponse) throws IOException {
-    try {
+    // TODO(nfuller): Work out whether there is anything we should be retrying at this level.
+//    try {
       httpEngine.sendRequest();
       route = httpEngine.getRoute();
       handshake = httpEngine.getConnection() != null
@@ -430,17 +431,17 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
       }
 
       return true;
-    } catch (IOException e) {
-      HttpEngine retryEngine = httpEngine.recover(e);
-      if (retryEngine != null) {
-        httpEngine = retryEngine;
-        return false;
-      }
-
-      // Give up; recovery is not possible.
-      httpEngineFailure = e;
-      throw e;
-    }
+//    } catch (IOException e) {
+//      HttpEngine retryEngine = httpEngine.recover(e);
+//      if (retryEngine != null) {
+//        httpEngine = retryEngine;
+//        return false;
+//      }
+//
+//      // Give up; recovery is not possible.
+//      httpEngineFailure = e;
+//      throw e;
+//    }
   }
 
   /**

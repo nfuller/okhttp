@@ -22,6 +22,7 @@ import com.squareup.okhttp.internal.http.HttpConnection;
 import com.squareup.okhttp.internal.http.HttpEngine;
 import com.squareup.okhttp.internal.http.HttpTransport;
 import com.squareup.okhttp.internal.http.OkHeaders;
+import com.squareup.okhttp.internal.http.RouteSelector;
 import com.squareup.okhttp.internal.http.SpdyTransport;
 import com.squareup.okhttp.internal.http.Transport;
 import com.squareup.okhttp.internal.spdy.SpdyConnection;
@@ -68,10 +69,13 @@ import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
  */
 public final class Connection {
   private final ConnectionPool pool;
-  private final Route route;
+  private final RouteSelector routeSelector;
 
-  private Socket socket;
   private boolean connected = false;
+  /** After connected: the socket to the set. */
+  private Socket socket;
+  /**  The route used to establish the socket connection. */
+  private Route route;
   private HttpConnection httpConnection;
   private SpdyConnection spdyConnection;
   private Protocol protocol = Protocol.HTTP_1_1;
@@ -86,9 +90,9 @@ public final class Connection {
    */
   private Object owner;
 
-  public Connection(ConnectionPool pool, Route route) {
+  public Connection(ConnectionPool pool, RouteSelector routeSelector) {
     this.pool = pool;
-    this.route = route;
+    this.routeSelector = routeSelector;
   }
 
   Object getOwner() {
@@ -141,25 +145,44 @@ public final class Connection {
     socket.close();
   }
 
-  void connect(int connectTimeout, int readTimeout, int writeTimeout, Request tunnelRequest)
+  void connect(int connectTimeout, int readTimeout, int writeTimeout, Request request)
       throws IOException {
     if (connected) throw new IllegalStateException("already connected");
 
-    if (route.proxy.type() == Proxy.Type.DIRECT || route.proxy.type() == Proxy.Type.HTTP) {
-      socket = route.address.socketFactory.createSocket();
-    } else {
-      socket = new Socket(route.proxy);
-    }
+    while (!connected) {
+      try {
+        route = routeSelector.next();
 
-    socket.setSoTimeout(readTimeout);
-    Platform.get().connectSocket(socket, route.inetSocketAddress, connectTimeout);
+        Request tunnelRequest = null;
+        if (route.requiresTunnel()) {
+          tunnelRequest = tunnelRequest(request);
+        }
 
-    if (route.address.sslSocketFactory != null) {
-      upgradeToTls(tunnelRequest, readTimeout, writeTimeout);
-    } else {
-      httpConnection = new HttpConnection(pool, this, socket);
+        if (route.proxy.type() == Proxy.Type.DIRECT || route.proxy.type() == Proxy.Type.HTTP) {
+          socket = route.address.socketFactory.createSocket();
+        } else {
+          socket = new Socket(route.proxy);
+        }
+
+        socket.setSoTimeout(readTimeout);
+        Platform.get().connectSocket(socket, route.inetSocketAddress, connectTimeout);
+
+        if (route.address.sslSocketFactory != null) {
+          upgradeToTls(tunnelRequest, readTimeout, writeTimeout);
+        } else {
+          httpConnection = new HttpConnection(pool, this, socket);
+        }
+        connected = true;
+      } catch (IOException e) {
+        // TODO(nfuller): This is mostly guesswork: study. nullify socket and route?
+        if (socket != null) {
+          socket.close();
+        }
+        if (!routeSelector.connectFailed(this, e) || !routeSelector.hasNext()) {
+          throw e;
+        }
+      }
     }
-    connected = true;
   }
 
   /**
@@ -170,9 +193,8 @@ public final class Connection {
     setOwner(owner);
 
     if (!isConnected()) {
-      Request tunnelRequest = tunnelRequest(request);
-      connect(client.getConnectTimeout(), client.getReadTimeout(),
-          client.getWriteTimeout(), tunnelRequest);
+      connect(client.getConnectTimeout(), client.getReadTimeout(), client.getWriteTimeout(),
+          request);
       if (isSpdy()) {
         client.getConnectionPool().share(this);
       }
@@ -189,9 +211,7 @@ public final class Connection {
    * headers. This avoids sending potentially sensitive data like HTTP cookies
    * to the proxy unencrypted.
    */
-  private Request tunnelRequest(Request request) throws IOException {
-    if (!route.requiresTunnel()) return null;
-
+  private static Request tunnelRequest(Request request) throws IOException {
     String host = request.url().getHost();
     int port = getEffectivePort(request.url());
     String authority = (port == getDefaultPort("https")) ? host : (host + ":" + port);

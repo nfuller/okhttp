@@ -146,6 +146,13 @@ public class Platform {
       Class<?> serverProviderClass = Class.forName(negoClassName + "$ServerProvider");
       Method putMethod = negoClass.getMethod("put", SSLSocket.class, providerClass);
       Method getMethod = negoClass.getMethod("get", SSLSocket.class);
+      try {
+        negoClass.getField("debug").set(null, true);
+      } catch (NoSuchFieldException e) {
+        e.printStackTrace();
+      } catch (IllegalAccessException e) {
+        e.printStackTrace();
+      }
       return new JdkWithJettyBootPlatform(
           putMethod, getMethod, clientProviderClass, serverProviderClass);
     } catch (ClassNotFoundException ignored) { // NPN isn't on the classpath.
