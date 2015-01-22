@@ -82,6 +82,16 @@ import static org.junit.Assert.fail;
 public final class CallTest {
   private static final SSLContext sslContext = SslContextBuilder.localhost();
 
+  private static final ConnectionSpec TLS_1_2_AND_BELOW =
+      new ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+          .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0)
+          .build();
+  private static final ConnectionSpec TLS_1_0_ONLY =
+      new ConnectionSpec.Builder(TLS_1_2_AND_BELOW)
+          .tlsVersions(TlsVersion.TLS_1_0)
+          .build();
+  private static final ConnectionSpec CLEARTEXT = ConnectionSpec.CLEARTEXT;
+
   @Rule public final TemporaryFolder tempDir = new TemporaryFolder();
   @Rule public final TestRule timeout = new Timeout(30_000);
 
@@ -550,13 +560,11 @@ public final class CallTest {
         .build();
 
     client.newCall(request).enqueue(new Callback() {
-      @Override
-      public void onFailure(Request request, IOException e) {
+      @Override public void onFailure(Request request, IOException e) {
         fail();
       }
 
-      @Override
-      public void onResponse(Response response) throws IOException {
+      @Override public void onResponse(Response response) throws IOException {
         throw new IOException("a");
       }
     });
@@ -609,13 +617,11 @@ public final class CallTest {
 
     Request request = new Request.Builder().url(server.getUrl("/a")).build();
     client.newCall(request).enqueue(new Callback() {
-      @Override
-      public void onFailure(Request request, IOException e) {
+      @Override public void onFailure(Request request, IOException e) {
         throw new AssertionError();
       }
 
-      @Override
-      public void onResponse(Response response) throws IOException {
+      @Override public void onResponse(Response response) throws IOException {
         InputStream bytes = response.body().byteStream();
         assertEquals('a', bytes.read());
         assertEquals('b', bytes.read());
@@ -659,6 +665,7 @@ public final class CallTest {
     }
   }
 
+  // https://github.com/square/okhttp/issues/442
   @Test public void timeoutsNotRetried() throws Exception {
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.NO_RESPONSE));
@@ -736,16 +743,24 @@ public final class CallTest {
   }
 
   @Test public void recoverFromTlsHandshakeFailure() throws Exception {
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY, CLEARTEXT));
+
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
 
-    suppressTlsFallbackScsv(client);
+    // The client socket enables two protocols. Both should be used in this test because of the
+    // connection specs set above.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0);
     client.setHostnameVerifier(new RecordingHostnameVerifier());
     Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
 
     executeSynchronously(new Request.Builder().url(server.getUrl("/")).build())
         .assertBody("abc");
+
+    // The FAIL_HANDSHAKE request is not stored by the server.
+    RecordedRequest request = server.takeRequest();
+    assertEquals(TlsVersion.TLS_1_0, request.getTlsVersion());
   }
 
   @Test public void recoverFromTlsHandshakeFailure_tlsFallbackScsvEnabled() throws Exception {
@@ -781,11 +796,15 @@ public final class CallTest {
   }
 
   @Test public void recoverFromTlsHandshakeFailure_Async() throws Exception {
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY, CLEARTEXT));
+
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse().setBody("abc"));
 
-    suppressTlsFallbackScsv(client);
+    // The client socket enables two protocols. Both should be used in this test because of the
+    // connection spec.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0);
     client.setHostnameVerifier(new RecordingHostnameVerifier());
 
     Request request = new Request.Builder()
@@ -797,12 +816,14 @@ public final class CallTest {
   }
 
   @Test public void noRecoveryFromTlsHandshakeFailureWhenTlsFallbackIsDisabled() throws Exception {
-    client.setConnectionSpecs(Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT));
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, CLEARTEXT));
 
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
 
-    suppressTlsFallbackScsv(client);
+    // Ensure the client socket enables two protocols. Only TLSv1.1 should be used in this test
+    // because of the connection spec.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0);
     client.setHostnameVerifier(new RecordingHostnameVerifier());
     Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
 
@@ -818,8 +839,7 @@ public final class CallTest {
   }
 
   @Test public void firstConnectionSpecAvoidedWhenPrimaryTlsVersionNotSupported() throws Exception {
-    client.setConnectionSpecs(
-        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY, CLEARTEXT));
 
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
@@ -843,8 +863,7 @@ public final class CallTest {
   }
 
   @Test public void secondConnectionSpecAvoidedWhenPrimaryTlsVersionNotSupported() throws Exception {
-    client.setConnectionSpecs(
-        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY, CLEARTEXT));
 
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
@@ -868,8 +887,7 @@ public final class CallTest {
   }
 
   @Test public void requestExceptionDoesNotCauseTlsDowngrade() throws Exception {
-    client.setConnectionSpecs(
-        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY, CLEARTEXT));
 
     server.get().useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
@@ -893,8 +911,7 @@ public final class CallTest {
 
   @Test public void cleartextCallsFailWhenCleartextIsDisabled() throws Exception {
     // Configure the client with only TLS configurations. No cleartext!
-    client.setConnectionSpecs(
-        Arrays.asList(ConnectionSpec.MODERN_TLS, ConnectionSpec.COMPATIBLE_TLS));
+    client.setConnectionSpecs(Arrays.asList(TLS_1_2_AND_BELOW, TLS_1_0_ONLY));
 
     server.enqueue(new MockResponse());
 
@@ -909,7 +926,8 @@ public final class CallTest {
 
   @Test public void setFollowSslRedirectsFalse() throws Exception {
     server.get().useHttps(sslContext.getSocketFactory(), false);
-    server.enqueue(new MockResponse().setResponseCode(301).addHeader("Location: http://square.com"));
+    server.enqueue(
+        new MockResponse().setResponseCode(301).addHeader("Location: http://square.com"));
 
     client.setFollowSslRedirects(false);
     client.setSslSocketFactory(sslContext.getSocketFactory());
@@ -1752,21 +1770,6 @@ public final class CallTest {
     return result;
   }
 
-  private void assertContains(Collection<String> collection, String element) {
-    for (String c : collection) {
-      if (c != null && c.equalsIgnoreCase(element)) return;
-    }
-    fail("No " + element + " in " + collection);
-  }
-
-  private void assertContainsNoneMatching(List<String> headers, String pattern) {
-    for (String header : headers) {
-      if (header.matches(pattern)) {
-        fail("Header " + header + " matches " + pattern);
-      }
-    }
-  }
-
   private static class RecordingSSLSocketFactory extends DelegatingSSLSocketFactory {
 
     private List<SSLSocket> socketsCreated = new ArrayList<SSLSocket>();
@@ -1790,9 +1793,12 @@ public final class CallTest {
    * TLS_FALLBACK_SCSV cipher on fallback connections. See
    * {@link com.squareup.okhttp.FallbackTestClientSocketFactory} for details.
    */
-  private static void suppressTlsFallbackScsv(OkHttpClient client) {
+  private static void installTestClientSocketFactory(OkHttpClient client,
+      TlsVersion... tlsVersions) {
+    assertTrue(tlsVersions.length > 0);
+    String[] enabledProtocols = TlsVersion.javaNames(tlsVersions);
     FallbackTestClientSocketFactory clientSocketFactory =
-        new FallbackTestClientSocketFactory(sslContext.getSocketFactory());
+        new FallbackTestClientSocketFactory(sslContext.getSocketFactory(), enabledProtocols);
     client.setSslSocketFactory(clientSocketFactory);
   }
 }
