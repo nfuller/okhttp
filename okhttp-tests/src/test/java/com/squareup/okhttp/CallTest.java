@@ -550,11 +550,13 @@ public final class CallTest {
         .build();
 
     client.newCall(request).enqueue(new Callback() {
-      @Override public void onFailure(Request request, IOException e) {
+      @Override
+      public void onFailure(Request request, IOException e) {
         fail();
       }
 
-      @Override public void onResponse(Response response) throws IOException {
+      @Override
+      public void onResponse(Response response) throws IOException {
         throw new IOException("a");
       }
     });
@@ -607,11 +609,13 @@ public final class CallTest {
 
     Request request = new Request.Builder().url(server.getUrl("/a")).build();
     client.newCall(request).enqueue(new Callback() {
-      @Override public void onFailure(Request request, IOException e) {
+      @Override
+      public void onFailure(Request request, IOException e) {
         throw new AssertionError();
       }
 
-      @Override public void onResponse(Response response) throws IOException {
+      @Override
+      public void onResponse(Response response) throws IOException {
         InputStream bytes = response.body().byteStream();
         assertEquals('a', bytes.read());
         assertEquals('b', bytes.read());
@@ -811,6 +815,80 @@ public final class CallTest {
     } catch (SSLHandshakeException expected) {
       // Android's response to the FAIL_HANDSHAKE
     }
+  }
+
+  @Test public void firstConnectionSpecAvoidedWhenPrimaryTlsVersionNotSupported() throws Exception {
+    client.setConnectionSpecs(
+        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+
+    server.get().useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.enqueue(new MockResponse().setBody("this request should not happen"));
+
+    // Ensure the client socket enables one protocol. Only one connection attempt should be made
+    // because the first connection spec should be skipped.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_0);
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SSLProtocolException expected) {
+      // RI response to the FAIL_HANDSHAKE
+    } catch (SSLHandshakeException expected) {
+      // Android's response to the FAIL_HANDSHAKE
+    }
+  }
+
+  @Test public void secondConnectionSpecAvoidedWhenPrimaryTlsVersionNotSupported() throws Exception {
+    client.setConnectionSpecs(
+        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+
+    server.get().useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.enqueue(new MockResponse().setBody("this request should not happen"));
+
+    // Ensure the client socket enables one protocol. Only one connection attempt should be made
+    // because the second connection spec should be skipped.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_1);
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SSLProtocolException expected) {
+      // RI response to the FAIL_HANDSHAKE
+    } catch (SSLHandshakeException expected) {
+      // Android's response to the FAIL_HANDSHAKE
+    }
+  }
+
+  @Test public void requestExceptionDoesNotCauseTlsDowngrade() throws Exception {
+    client.setConnectionSpecs(
+        Arrays.asList(ConnectionSpec.TLS_1_1_AND_BELOW, ConnectionSpec.TLS_1_0_ONLY));
+
+    server.get().useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
+    server.enqueue(new MockResponse().setBody("abc"));
+
+    // Ensure the client socket enables one protocol. Only one connection attempt should be made
+    // because the second connection spec should be skipped.
+    installTestClientSocketFactory(client, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0);
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    Internal.instance.setNetwork(client, new DoubleInetAddressNetwork());
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    Response response = client.newCall(request).execute();
+    assertEquals("abc", response.body().string());
+
+    RecordedRequest request1 = server.takeRequest();
+    assertEquals(TlsVersion.TLS_1_1, request1.getTlsVersion());
+    RecordedRequest request2 = server.takeRequest();
+    assertEquals(TlsVersion.TLS_1_1, request2.getTlsVersion());
   }
 
   @Test public void cleartextCallsFailWhenCleartextIsDisabled() throws Exception {
@@ -1390,7 +1468,8 @@ public final class CallTest {
 
   @Test public void cancelInFlightBeforeResponseReadThrowsIOE() throws Exception {
     server.get().setDispatcher(new Dispatcher() {
-      @Override public MockResponse dispatch(RecordedRequest request) {
+      @Override
+      public MockResponse dispatch(RecordedRequest request) {
         client.cancel("request");
         return new MockResponse().setBody("A");
       }
